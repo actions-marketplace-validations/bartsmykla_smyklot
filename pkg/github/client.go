@@ -159,10 +159,11 @@ func (c *Client) ApprovePR(ctx context.Context, owner, repo string, prNumber int
 	return err
 }
 
-// DismissReview dismisses all approved reviews by the authenticated user
+// DismissReview dismisses all approved reviews by the authenticated user.
 //
-// WARNING: This method calls GET /user which requires special permissions
-// not granted to GitHub App installation tokens. Use DismissReviewByUsername instead.
+// Deprecated: This method calls GetAuthenticatedUser which fails with GitHub App
+// installation tokens (403 "Resource not accessible by integration").
+// Use DismissReviewByUsername instead.
 func (c *Client) DismissReview(ctx context.Context, owner, repo string, prNumber int) error {
 	username, err := c.GetAuthenticatedUser(ctx)
 	if err != nil {
@@ -190,7 +191,12 @@ func (c *Client) DismissReviewByUsername(
 	return c.dismissApprovedReviews(ctx, owner, repo, prNumber, username, reviews)
 }
 
-// GetAuthenticatedUser retrieves the authenticated user's username
+// GetAuthenticatedUser retrieves the authenticated user's username.
+//
+// Deprecated: This method calls GET /user which fails with GitHub App installation
+// tokens (403 "Resource not accessible by integration"). Use the configured
+// bot username (RuntimeConfig.BotUsername) instead. For GitHub Apps, the username
+// format is "{app-slug}[bot]" (e.g., "smyklot[bot]").
 func (c *Client) GetAuthenticatedUser(ctx context.Context) (string, error) {
 	userPath := "/user"
 	userData, err := c.makeRequest(ctx, "GET", userPath, nil)
@@ -563,6 +569,10 @@ func (c *Client) GetPRInfo(ctx context.Context, owner, repo string, prNumber int
 		info.Mergeable = mergeable
 	}
 
+	if mergeableState, ok := response["mergeable_state"].(string); ok {
+		info.MergeableState = MergeableState(mergeableState)
+	}
+
 	if title, ok := response["title"].(string); ok {
 		info.Title = title
 	}
@@ -728,6 +738,49 @@ func (c *Client) HasWritePermission(ctx context.Context, owner, repo, username s
 	return permission == "admin" || permission == "write", nil
 }
 
+// IsTeamMember checks if a user is a member of a team
+//
+// Returns true if the user is an active member of the team (org/team-slug format).
+// Returns false if the user is not a member or membership is pending.
+func (c *Client) IsTeamMember(ctx context.Context, org, teamSlug, username string) (bool, error) {
+	path := fmt.Sprintf("/orgs/%s/teams/%s/memberships/%s", org, teamSlug, username)
+
+	data, err := c.makeRequest(ctx, "GET", path, nil)
+	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) {
+			// 404 means user is not a member
+			if apiErr.StatusCode == 404 {
+				return false, nil
+			}
+			// 403 likely means insufficient permissions (missing read:org or members:read)
+			if apiErr.StatusCode == 403 {
+				return false, fmt.Errorf("insufficient permissions to check team membership (need read:org or members:read scope): %w", err)
+			}
+		}
+		return false, err
+	}
+
+	var response map[string]interface{}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return false, NewAPIError(ErrResponseParse, 0, "GET", path, err)
+	}
+
+	// Check if membership is active (not pending)
+	state, ok := response["state"].(string)
+	if !ok {
+		return false, NewAPIError(
+			ErrResponseParse,
+			0,
+			"GET",
+			path,
+			fmt.Errorf("no state field in response"),
+		)
+	}
+
+	return state == "active", nil
+}
+
 // IsMergeQueueEnabled checks if merge queue is enabled for a branch
 func (c *Client) IsMergeQueueEnabled(ctx context.Context, owner, repo, branch string) (bool, error) {
 	path := fmt.Sprintf("/repos/%s/%s/branches/%s/protection", owner, repo, branch)
@@ -762,6 +815,169 @@ func (c *Client) IsMergeQueueEnabled(ctx context.Context, owner, repo, branch st
 	}
 
 	return false, nil
+}
+
+// GetRequiredStatusChecks retrieves the list of required status check names from branch protection
+//
+// Returns empty slice if branch protection is not enabled or no required checks configured.
+func (c *Client) GetRequiredStatusChecks(ctx context.Context, owner, repo, branch string) ([]string, error) {
+	path := fmt.Sprintf("/repos/%s/%s/branches/%s/protection/required_status_checks", owner, repo, branch)
+
+	data, err := c.makeRequest(ctx, "GET", path, nil)
+	if err != nil {
+		// 404 means branch protection not enabled or no required status checks
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
+			return []string{}, nil
+		}
+
+		return nil, err
+	}
+
+	var response struct {
+		Contexts []string `json:"contexts"` // Legacy required checks
+		Checks   []struct {
+			Context string `json:"context"` // New required checks format
+		} `json:"checks"`
+	}
+
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, NewAPIError(ErrResponseParse, 0, "GET", path, err)
+	}
+
+	// Combine both legacy contexts and new checks format
+	required := make([]string, 0, len(response.Contexts)+len(response.Checks))
+	required = append(required, response.Contexts...)
+
+	for _, check := range response.Checks {
+		required = append(required, check.Context)
+	}
+
+	return required, nil
+}
+
+// GetCheckStatus retrieves the CI check status for a commit
+//
+// Returns a CheckStatus struct indicating whether all checks pass, are pending, or failing.
+// Uses the GitHub REST API: GET /repos/{owner}/{repo}/commits/{ref}/check-runs
+//
+// If requiredOnly is specified (non-empty slice), only checks matching those names are considered.
+func (c *Client) GetCheckStatus(
+	ctx context.Context,
+	owner, repo, ref string,
+	requiredOnly []string,
+) (*CheckStatus, error) {
+	path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, ref)
+
+	data, err := c.makeRequestWithRetry(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response struct {
+		TotalCount int `json:"total_count"`
+		CheckRuns  []struct {
+			Name       string `json:"name"`
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, NewAPIError(ErrResponseParse, 0, "GET", path, err)
+	}
+
+	// Build map for quick required check lookup
+	requiredMap := make(map[string]bool)
+	for _, name := range requiredOnly {
+		requiredMap[name] = true
+	}
+
+	status := &CheckStatus{
+		Total: response.TotalCount,
+	}
+
+	// If filtering by required checks only, reset total to count only required
+	if len(requiredOnly) > 0 {
+		status.Total = 0
+	}
+
+	for _, run := range response.CheckRuns {
+		// If filtering by required checks, skip non-required checks
+		if len(requiredOnly) > 0 && !requiredMap[run.Name] {
+			continue
+		}
+
+		// Count this check toward the total if filtering
+		if len(requiredOnly) > 0 {
+			status.Total++
+		}
+
+		switch run.Status {
+		case "completed":
+			switch run.Conclusion {
+			case "success", "skipped", "neutral":
+				status.Passed++
+			case "failure", "cancelled", "timed_out", "action_required":
+				status.Failed++
+			}
+		case "queued", "in_progress", "pending", "waiting":
+			status.InProgress++
+		}
+	}
+
+	status.AllPassing = status.Total > 0 && status.Failed == 0 && status.InProgress == 0
+	status.Pending = status.InProgress > 0
+	status.Failing = status.Failed > 0
+
+	status.Summary = fmt.Sprintf("%d/%d checks passing", status.Passed, status.Total)
+	if status.InProgress > 0 {
+		status.Summary += fmt.Sprintf(", %d in progress", status.InProgress)
+	}
+
+	if status.Failed > 0 {
+		status.Summary += fmt.Sprintf(", %d failed", status.Failed)
+	}
+
+	return status, nil
+}
+
+// GetPRHeadRef retrieves the head commit SHA of a pull request
+//
+// Returns the SHA of the latest commit on the PR's head branch.
+func (c *Client) GetPRHeadRef(
+	ctx context.Context,
+	owner, repo string,
+	prNumber int,
+) (string, error) {
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, prNumber)
+
+	data, err := c.makeRequestWithRetry(ctx, "GET", path, nil)
+	if err != nil {
+		return "", err
+	}
+
+	var response struct {
+		Head struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+
+	if err := json.Unmarshal(data, &response); err != nil {
+		return "", NewAPIError(ErrResponseParse, 0, "GET", path, err)
+	}
+
+	if response.Head.SHA == "" {
+		return "", NewAPIError(
+			ErrResponseParse,
+			0,
+			"GET",
+			path,
+			fmt.Errorf("no head SHA in response"),
+		)
+	}
+
+	return response.Head.SHA, nil
 }
 
 // makeRequestWithRetry makes an HTTP request with retry logic and exponential backoff

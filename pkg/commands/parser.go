@@ -11,12 +11,22 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/bartsmykla/smyklot/pkg/config"
+	"github.com/smykla-labs/smyklot/pkg/config"
 )
 
 var (
 	// mentionCommandRegex matches @smyklot command patterns
 	mentionCommandRegex = regexp.MustCompile(`(?i)@smyklot\s+(\w+)`)
+
+	// waitForCIRegex matches "after CI" modifier phrases
+	// Patterns: "after CI", "after checks", "when green", "when CI passes",
+	// "when checks pass", "once CI passes", "once checks pass"
+	// Supports optional "required" modifier: "after required CI"
+	waitForCIRegex = regexp.MustCompile(`(?i)\b(?:after|when|once)\s+(?:required\s+)?(?:CI|CD|GHA|checks?|green|workflows?|github\s+actions?)(?:\s+(?:pass(?:es)?|are?\s+green|finish(?:es)?|complete(?:s)?))?\b`)
+
+	// requiredChecksRegex matches "required" modifier in CI phrases
+	// Patterns: "required CI", "required checks", etc.
+	requiredChecksRegex = regexp.MustCompile(`(?i)\b(?:after|when|once)\s+required\s+(?:CI|CD|GHA|checks?|workflows?|github\s+actions?)\b`)
 
 	// validCommands maps command names to their corresponding types
 	validCommands = map[string]CommandType{
@@ -111,6 +121,16 @@ func ParseCommand(commentBody string, cfg *config.Config) (Command, error) {
 		cmd.Commands = commands
 		cmd.Type = commands[0] // For backward compatibility
 		cmd.IsValid = true
+
+		// Check for "after CI" modifier - only applies to merge commands
+		if hasMergeCommand(commands) && detectWaitForCIModifier(commentBody) {
+			cmd.WaitForCI = true
+
+			// Check for "required checks only" modifier
+			if detectRequiredChecksModifier(commentBody) {
+				cmd.RequiredChecksOnly = true
+			}
+		}
 	}
 
 	return cmd, nil
@@ -248,10 +268,21 @@ func looksLikeNaturalLanguage(line string) bool {
 	return false
 }
 
-// isCommandHeavyLine checks if a line is "command-heavy" (>66% commands/fillers)
+// isCommandHeavyLine checks if a line is "command-heavy" (>66% commands/fillers/CI-terms)
 func isCommandHeavyLine(line string, cfg *config.Config) bool {
 	fillerWords := map[string]bool{
 		"and": true, "please": true, "this": true, "the": true, "it": true,
+	}
+
+	// CI-related technical terms that indicate command context
+	ciRelatedWords := map[string]bool{
+		"ci": true, "cd": true, "gha": true, "checks": true, "check": true,
+		"workflows": true, "workflow": true, "green": true,
+		"github": true, "actions": true, "action": true,
+		"after": true, "when": true, "once": true,
+		"pass": true, "passes": true, "passing": true,
+		"finish": true, "finishes": true, "complete": true, "completes": true,
+		"required": true,
 	}
 
 	words := strings.Fields(line)
@@ -273,7 +304,8 @@ func isCommandHeavyLine(line string, cfg *config.Config) bool {
 
 		totalNonMentionWords++
 
-		if resolveCommand(cleanWord, cfg) != CommandUnknown || fillerWords[cleanWord] {
+		// Count as command-related if it's a command, filler, or CI-related term
+		if resolveCommand(cleanWord, cfg) != CommandUnknown || fillerWords[cleanWord] || ciRelatedWords[cleanWord] {
 			commandWordCount++
 		}
 	}
@@ -282,7 +314,7 @@ func isCommandHeavyLine(line string, cfg *config.Config) bool {
 		return false
 	}
 
-	// Only process this line if > 66% of words are commands/fillers
+	// Only process this line if > 66% of words are commands/fillers/CI-terms
 	return float64(commandWordCount)/float64(totalNonMentionWords) > 0.66
 }
 
@@ -315,10 +347,21 @@ func extractCommandsFromLine(line string, cfg *config.Config, commandsFound map[
 	}
 }
 
-// isLineOnlyCommandsAndFillers checks if line contains ONLY commands and filler words
+// isLineOnlyCommandsAndFillers checks if line contains ONLY commands, fillers, and CI terms
 func isLineOnlyCommandsAndFillers(line string, cfg *config.Config) bool {
 	fillerWords := map[string]bool{
 		"and": true, "please": true, "this": true, "the": true, "it": true,
+	}
+
+	// CI-related technical terms
+	ciRelatedWords := map[string]bool{
+		"ci": true, "cd": true, "gha": true, "checks": true, "check": true,
+		"workflows": true, "workflow": true, "green": true,
+		"github": true, "actions": true, "action": true,
+		"after": true, "when": true, "once": true,
+		"pass": true, "passes": true, "passing": true,
+		"finish": true, "finishes": true, "complete": true, "completes": true,
+		"required": true,
 	}
 
 	words := strings.Fields(line)
@@ -331,8 +374,8 @@ func isLineOnlyCommandsAndFillers(line string, cfg *config.Config) bool {
 			continue
 		}
 
-		// If it's not a command or filler word, return false
-		if resolveCommand(cleanWord, cfg) == CommandUnknown && !fillerWords[cleanWord] {
+		// If it's not a command, filler, or CI-related word, return false
+		if resolveCommand(cleanWord, cfg) == CommandUnknown && !fillerWords[cleanWord] && !ciRelatedWords[cleanWord] {
 			return false
 		}
 	}
@@ -426,4 +469,33 @@ func resolveCommand(commandName string, cfg *config.Config) CommandType {
 	}
 
 	return cmdType
+}
+
+// detectWaitForCIModifier checks if the comment contains "after CI" modifier phrases
+// Matches patterns like: "after CI", "when green", "when checks pass",
+// "once CI passes", "after checks", etc.
+func detectWaitForCIModifier(text string) bool {
+	return waitForCIRegex.MatchString(text)
+}
+
+// detectRequiredChecksModifier checks if the comment specifies "required checks only"
+// Matches patterns like: "after required CI", "when required checks pass", etc.
+func detectRequiredChecksModifier(text string) bool {
+	return requiredChecksRegex.MatchString(text)
+}
+
+// isMergeCommand checks if a command type is a merge-related command
+func isMergeCommand(cmdType CommandType) bool {
+	return cmdType == CommandMerge || cmdType == CommandSquash || cmdType == CommandRebase
+}
+
+// hasMergeCommand checks if any merge-related command is present
+func hasMergeCommand(commands []CommandType) bool {
+	for _, cmd := range commands {
+		if isMergeCommand(cmd) {
+			return true
+		}
+	}
+
+	return false
 }
